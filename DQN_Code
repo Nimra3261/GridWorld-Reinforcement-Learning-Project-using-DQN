@@ -1,0 +1,204 @@
+import os
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
+import tkinter as tk
+import numpy as np
+import time
+from PIL import Image, ImageTk
+import pygame
+import random
+import tensorflow as tf
+from collections import deque
+
+class GridWorld:
+    def __init__(self, grid_size=5, num_cats=3):
+        self.grid_size = grid_size
+        self.num_cats = num_cats
+        self.state = (0, 0)
+        self.goal_state = (grid_size-1, grid_size-1)
+        self.cat_states = self._generate_cat_positions()
+        self.actions = ['up', 'down', 'left', 'right']
+
+    def _generate_cat_positions(self):
+        cat_positions = []
+        while len(cat_positions) < self.num_cats:
+            pos = (np.random.randint(0, self.grid_size), np.random.randint(0, self.grid_size))
+            if pos != self.state and pos != self.goal_state and pos not in cat_positions:
+                cat_positions.append(pos)
+        return cat_positions
+
+    def reset(self):
+        self.state = (0, 0)
+        self.cat_states = self._generate_cat_positions()
+        return self.state
+
+    def step(self, action):
+        x, y = self.state
+        if action == 'up' and x > 0:
+            x -= 1
+        elif action == 'down' and x < self.grid_size - 1:
+            x += 1
+        elif action == 'left' and y > 0:
+            y -= 1
+        elif action == 'right' and y < self.grid_size - 1:
+            y += 1
+
+        self.state = (x, y)
+        reward = -10 if self.state in self.cat_states else 10 if self.state == self.goal_state else -0.1
+        done = self.state == self.goal_state or self.state in self.cat_states
+        return self.state, reward, done
+
+    def render(self):
+        grid = np.zeros((self.grid_size, self.grid_size))
+        x, y = self.state
+        gx, gy = self.goal_state
+        grid[x, y] = -1  # Bee
+        grid[gx, gy] = 1  # Flower
+        for cx, cy in self.cat_states:
+            grid[cx, cy] = -2  # Cats
+        return grid
+
+class DQNAgent:
+    def __init__(self, env, state_size, action_size, gamma=0.95, epsilon=1.0, epsilon_min=0.1, epsilon_decay=0.995, learning_rate=0.001, batch_size=32):
+        self.env = env
+        self.state_size = state_size
+        self.action_size = action_size
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.epsilon_min = epsilon_min
+        self.epsilon_decay = epsilon_decay
+        self.learning_rate = learning_rate
+        self.batch_size = batch_size
+        self.memory = deque(maxlen=2000)
+        self.model = self._build_model()
+        self.target_model = self._build_model()
+        self.update_target_model()
+
+    def _build_model(self):
+        model = tf.keras.Sequential()
+        model.add(tf.keras.layers.Dense(24, input_dim=self.state_size, activation='relu'))
+        model.add(tf.keras.layers.Dense(24, activation='relu'))
+        model.add(tf.keras.layers.Dense(self.action_size, activation='linear'))
+        model.compile(loss='mse', optimizer=tf.keras.optimizers.Adam(learning_rate=self.learning_rate))
+
+        return model
+
+    def update_target_model(self):
+        self.target_model.set_weights(self.model.get_weights())
+
+    def remember(self, state, action, reward, next_state, done):
+        self.memory.append((state, action, reward, next_state, done))
+
+    def act(self, state):
+        if np.random.rand() <= self.epsilon:
+            return random.choice(self.env.actions)
+        act_values = self.model.predict(state)
+        return self.env.actions[np.argmax(act_values[0])]
+
+    def replay(self):
+        minibatch = random.sample(self.memory, min(len(self.memory), self.batch_size))
+        for state, action, reward, next_state, done in minibatch:
+            target = reward
+            if not done:
+                target += self.gamma * np.amax(self.target_model.predict(next_state)[0])
+            target_f = self.model.predict(state)
+            target_f[0][self.env.actions.index(action)] = target
+            self.model.fit(state, target_f, epochs=1, verbose=0)
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+
+    def train(self, num_episodes=10000, target_update_freq=10):
+        for episode in range(num_episodes):
+            state = self.env.reset()
+            state = np.reshape(state, [1, self.state_size])
+            done = False
+            while not done:
+                action = self.act(state)
+                next_state, reward, done = self.env.step(action)
+                next_state = np.reshape(next_state, [1, self.state_size])
+                self.remember(state, action, reward, next_state, done)
+                state = next_state
+                if done:
+                    break
+            self.replay()
+            if episode % target_update_freq == 0:
+                self.update_target_model()
+
+class RLVisualizer(tk.Tk):
+    def __init__(self, agent, env):
+        super().__init__()
+        self.agent = agent
+        self.env = env
+        self.grid_size = env.grid_size
+        self.cell_size = 100  # Increased cell size for better visibility
+        self.title("RL Agent Visualizer")
+        self.geometry(f"{self.grid_size * self.cell_size}x{self.grid_size * self.cell_size + 50}")
+        self.canvas = tk.Canvas(self, width=self.grid_size * self.cell_size, height=self.grid_size * self.cell_size)
+        self.canvas.pack()
+        
+        self.info_label = tk.Label(self, text="")
+        self.info_label.pack()
+
+        # Load and resize images
+        self.bee_image = Image.open("bee.png").resize((self.cell_size, self.cell_size), Image.LANCZOS)
+        self.flower_image = Image.open("flower.png").resize((self.cell_size, self.cell_size), Image.LANCZOS)
+        self.cat_image = Image.open("cat.png").resize((self.cell_size, self.cell_size), Image.LANCZOS)
+        
+        # Convert to PhotoImage
+        self.bee_photo = ImageTk.PhotoImage(self.bee_image)
+        self.flower_photo = ImageTk.PhotoImage(self.flower_image)
+        self.cat_photo = ImageTk.PhotoImage(self.cat_image)
+
+        # Initialize pygame mixer
+        pygame.mixer.init()
+        self.hit_sound = pygame.mixer.Sound("BEE.wav")
+
+        self.cumulative_reward = 0
+        self.after(0, self.run_episode)
+
+    def render_grid(self):
+        self.canvas.delete("all")
+        grid = self.env.render()
+        for i in range(self.grid_size):
+            for j in range(self.grid_size):
+                x0, y0 = j * self.cell_size, i * self.cell_size
+                x1, y1 = x0 + self.cell_size, y0 + self.cell_size
+                if grid[i, j] == -1:
+                    self.canvas.create_image((x0 + self.cell_size // 2, y0 + self.cell_size // 2), image=self.bee_photo)
+                elif grid[i, j] == 1:
+                    self.canvas.create_image((x0 + self.cell_size // 2, y0 + self.cell_size // 2), image=self.flower_photo)
+                elif grid[i, j] == -2:
+                    self.canvas.create_image((x0 + self.cell_size // 2, y0 + self.cell_size // 2), image=self.cat_photo)
+                else:
+                    self.canvas.create_rectangle(x0, y0, x1, y1, outline="black")
+
+    def run_episode(self):
+        state = self.env.reset()
+        state = np.reshape(state, [1, self.agent.state_size])
+        done = False
+        episode_reward = 0
+        while not done:
+            self.render_grid()
+            self.update_idletasks()
+            self.update()
+            time.sleep(0.5)
+            action = self.agent.act(state)
+            next_state, reward, done = self.env.step(action)
+            next_state = np.reshape(next_state, [1, self.agent.state_size])
+            self.agent.remember(state, action, reward, next_state, done)
+            self.agent.replay()
+            state = next_state
+            episode_reward += reward
+            self.cumulative_reward += reward
+            self.info_label.config(text=f"Cumulative Reward: {self.cumulative_reward}")
+            if done:
+                if self.env.state in self.env.cat_states:
+                    self.hit_sound.play()
+                break
+        self.after(1000, self.run_episode)
+
+if __name__ == "__main__":
+    env = GridWorld(grid_size=5, num_cats=3)
+    agent = DQNAgent(env, state_size=2, action_size=4)
+    app = RLVisualizer(agent, env)
+    app.mainloop()
